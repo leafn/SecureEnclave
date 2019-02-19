@@ -1,21 +1,23 @@
-import Security
+import UIKit
+import CommonCrypto
 
-let applicationTag: String = "com.leafn.secureenclavetest"
-let operationPrompt: String = "인증이 필요합니다."
-
-struct SecureEnclaveError : Error {
-    let localizedDescription: String
-    let status: OSStatus?
+struct SecureEnclaveError: Error {
+    let message: String
+    let osStatus: OSStatus?
     
-    init(status: OSStatus?, localizedDescription: String) {
-        self.localizedDescription = localizedDescription
-        self.status = status
+    init(message: String, osStatus: OSStatus?) {
+        self.message = message
+        self.osStatus = osStatus
     }
 }
 
 class SecureEnclave: NSObject {
     
-    private var keyTypeEllipticCurve: String {
+    let operationPrompt: String = "인증이 필요합니다."
+    let publicLabel: String
+    let privateLabel: String
+    
+    private var attrKeyTypeEllipticCurve: String {
         if #available(iOS 10.0, *) {
             return kSecAttrKeyTypeECSECPrimeRandom as String
         } else {
@@ -23,74 +25,88 @@ class SecureEnclave: NSObject {
         }
     }
     
-    func generateECCKeyPair(privateLabel: String, publicLabel: String, accessGroup: String?) throws {
-        
-        let privateAccess: SecAccessControl = SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage, .biometryCurrentSet], nil)!
-        
-        // private
-        var privateKeyParams: [String: Any] = [
-            kSecAttrLabel as String: privateLabel,
-            kSecAttrIsPermanent as String: true,
-            //            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow,
-            //            kSecUseAuthenticationContext as String: operationPrompt
-            kSecAttrAccessControl as String: privateAccess
-        ]
-        
-        if let accessGroup = accessGroup {
-            privateKeyParams[kSecAttrAccessGroup as String] = accessGroup
-        }
-        
-        var publicKeyParams: [String: Any] = [
-            kSecAttrLabel as String: publicLabel,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        ]
-        
-        if let accessGroup = accessGroup {
-            publicKeyParams[kSecAttrAccessGroup as String] = accessGroup
-        }
-        
-        let attributes: [String: Any] = [
-            kSecAttrKeyType as String: keyTypeEllipticCurve,
-            kSecAttrKeySizeInBits as String: 256,
-            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
-            kSecPrivateKeyAttrs as String: privateKeyParams,
-            kSecPublicKeyAttrs as String: publicKeyParams
-        ]
-        
-        var error: Unmanaged<CFError>?
-        guard SecKeyCreateRandomKey(attributes as CFDictionary, &error) != nil else {
-            throw error!.takeRetainedValue() as Error
-        }
+    init(publicLabel: String, privateLabel: String) {
+        self.publicLabel = publicLabel
+        self.privateLabel = privateLabel
     }
     
-    func getPublicKey(label: String) throws -> Data{
+    func generate() throws -> (SecKey, SecKey) {
+        let access: SecAccessControl = SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .privateKeyUsage, nil)!
+        
+        let privateKeyParams: [String: Any] = [
+            kSecAttrLabel as String: privateLabel,
+            kSecAttrIsPermanent as String: true,
+            kSecAttrAccessControl as String: access,
+        ]
+        
+        let params: [String: Any] = [
+            kSecAttrKeyType as String: attrKeyTypeEllipticCurve,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+            kSecPrivateKeyAttrs as String: privateKeyParams
+        ]
+        
+        var publicKey, privateKey: SecKey?
+        
+        let status = SecKeyGeneratePair(params as CFDictionary, &publicKey, &privateKey)
+        
+        guard status == errSecSuccess else {
+            throw SecureEnclaveError(message: "could not generate keypair", osStatus: status)
+        }
+        
+        return (publicKey: publicKey!, privateKey: privateKey!)
+    }
+    
+    func publicKey() throws -> (SecKey, Data) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
-            kSecAttrKeyType as String: keyTypeEllipticCurve,
-            //kSecAttrApplicationTag as String: applicationTag,
-            kSecAttrApplicationTag as String: label,
+            kSecAttrKeyType as String: attrKeyTypeEllipticCurve,
+            kSecAttrApplicationTag as String: publicLabel,
             kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
             kSecReturnData as String: true,
             kSecReturnRef as String: true,
-            kSecReturnPersistentRef as String: true
+            kSecReturnPersistentRef as String: true,
         ]
         
-        let rawKey = try getSecKeyWithQuery(query)
-        let converted = rawKey as! [String: Any]
-        return converted[kSecValueData as String] as! Data
+        let raw = try getSecKeyWithQuery(query)
+        
+        return (ref: raw[kSecValueRef as String] as! SecKey, privateKey: raw[kSecValueData as String] as! Data)
     }
     
-    func getPrivateKey(label: String) throws -> SecKey{
+    func privateKey() throws -> SecKey {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
-            kSecAttrLabel as String: label,
-            kSecReturnRef as String: true,
-            kSecUseOperationPrompt as String: operationPrompt
+            kSecAttrLabel as String: privateLabel,
+            kSecReturnRef as String: true
         ]
         
         let raw = try getSecKeyWithQuery(query)
         return raw as! SecKey
+    }
+    
+    func forceSavePublicKey(publicKey: SecKey) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrKeyType as String: attrKeyTypeEllipticCurve,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
+            kSecAttrApplicationTag as String: publicLabel,
+            kSecValueRef as String: publicKey,
+            kSecAttrIsPermanent as String: true,
+            kSecReturnData as String: true,
+        ]
+        
+        var raw: CFTypeRef?
+        var status = SecItemAdd(query as CFDictionary, &raw)
+        
+        if status == errSecDuplicateItem {
+            status = SecItemDelete(query as CFDictionary)
+            status = SecItemAdd(query as CFDictionary, &raw)
+        }
+        
+        guard status == errSecSuccess else {
+            throw SecureEnclaveError(message: "could not save keypair", osStatus: status)
+        }
     }
     
     func getSecKeyWithQuery(_ query: [String: Any]) throws -> CFTypeRef {
@@ -98,81 +114,81 @@ class SecureEnclave: NSObject {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         
         guard status == errSecSuccess else {
-            throw SecureEnclaveError(status: status, localizedDescription: "OSStatus Error")
+            throw SecureEnclaveError(message: "could not get key for query: \(query)", osStatus: status)
         }
         
         return result!
     }
     
-    func removePublicKey(label: String) throws {
+    func removePublicKey() throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
-            kSecAttrKeyType as String: keyTypeEllipticCurve,
+            kSecAttrKeyType as String: attrKeyTypeEllipticCurve,
             kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
-            kSecAttrApplicationTag as String: label
+            kSecAttrApplicationTag as String: publicLabel
         ]
         
         let status = SecItemDelete(query as CFDictionary)
         
         guard status == errSecSuccess else {
-            throw SecureEnclaveError(status: status, localizedDescription: "OSStatus Error")
+            throw SecureEnclaveError(message: "could not delete private key", osStatus: status)
         }
     }
     
-    func removePrivateKey(label: String) throws {
+    func removePrivateKey() throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
-            kSecAttrLabel as String: label,
-            kSecReturnRef as String: true
+            kSecAttrLabel as String: privateLabel,
+            kSecReturnRef as String: true,
         ]
         
         let status = SecItemDelete(query as CFDictionary)
         
         guard status == errSecSuccess else {
-            throw SecureEnclaveError(status: status, localizedDescription: "OSStatus Error")
+            throw SecureEnclaveError(message: "could not delete private key", osStatus: status)
         }
     }
     
-    func sign(digest: Data, privateKey: SecKey) throws -> Data{
+    func sign(_ digest: Data, privateKey: SecKey) throws -> Data{
+        
         let blockSize = 256
-        let maxChunkSize = blockSize - 11
         
-        guard digest.count / MemoryLayout<UInt8>.size <= maxChunkSize else {
-            throw SecureEnclaveError(status: nil, localizedDescription: "data length exceeds \(maxChunkSize)")
-        }
+        var digestData = Data(count: Int(CC_SHA256_DIGEST_LENGTH))
         
-        var digestBytes = [UInt8](repeating: 0, count: digest.count / MemoryLayout<UInt8>.size)
-        digest.copyBytes(to: &digestBytes, count: digest.count)
+        _ = digestData.withUnsafeMutableBytes({digestBytes in
+            digest.withUnsafeBytes({messageBytes in
+                CC_SHA256(messageBytes, CC_LONG(digest.count), digestBytes)
+            })
+        })
+        
+        var digestBytes = [UInt8](repeating: 0, count: digestData.count)
+        digestData.copyBytes(to: &digestBytes, count: digestData.count)
         
         var signatureBytes = [UInt8](repeating: 0, count: blockSize)
         var signatureLength = blockSize
         
-        let status = SecKeyRawSign(privateKey, .PKCS1, digestBytes, digestBytes.count, &signatureBytes, &signatureLength)
+        let status = SecKeyRawSign(privateKey, .PKCS1SHA256, digestBytes, digestBytes.count, &signatureBytes, &signatureLength)
         
         guard status == errSecSuccess else {
             if status == errSecParam {
-                throw SecureEnclaveError(status: status, localizedDescription: "Could not create signature due to bad parameters")
+                throw SecureEnclaveError(message: "Could not create signature due to bad parameters", osStatus: status)
             } else {
-                throw SecureEnclaveError(status: status, localizedDescription: "Could not create signature")
+                throw SecureEnclaveError(message: "Could not create signature", osStatus: status)
             }
         }
+        
         return Data(bytes: UnsafePointer<UInt8>(signatureBytes), count: signatureLength)
     }
     
-    func verify(signature: Data, digest: Data, publicKey: SecKey) throws -> Bool {
-        var digestBytes = [UInt8](repeating: 0, count: digest.count)
-        digest.copyBytes(to: &digestBytes, count: digest.count)
+    func verify() {
         
-        var signatureBytes = [UInt8](repeating: 0, count: signature.count)
-        signature.copyBytes(to: &signatureBytes, count: signature.count)
-        
-        let status = SecKeyRawVerify(publicKey, .PKCS1, digestBytes, digestBytes.count, signatureBytes, signatureBytes.count)
-        
-        guard status == errSecSuccess else {
-            throw SecureEnclaveError(status: status, localizedDescription: "Could not create signature")
-        }
-        
-        return true
     }
+    
+    func remove() {
+        try! removePublicKey()
+        try! removePrivateKey()
+    }
+    
+    
 }
